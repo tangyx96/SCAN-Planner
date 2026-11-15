@@ -10,15 +10,20 @@
 
 namespace {
 
+// 用于步态相位计算的圆周率常量。
 constexpr double kPi = 3.14159265358979323846;
 
 double clamp(double value, double low, double high) {
+  // 限制关节角或控制量范围，避免发布超出简化模型安全范围的数值。
   return std::max(low, std::min(value, high));
 }
 
 class Go2GaitPublisher {
  public:
   Go2GaitPublisher() : nh_(), pnh_("~") {
+    // ==================== 1. 读取步态和通信参数 ====================
+    // 该节点不负责轨迹规划，而是将机器人水平运动状态映射为简化的
+    // 四足小跑关节摆动，用于仿真可视化和基础运动表现。
     pnh_.param("rate", rate_, 60.0);
     pnh_.param("gait_frequency", gait_frequency_, 2.2);
     pnh_.param("min_walk_speed", min_walk_speed_, 0.05);
@@ -33,10 +38,14 @@ class Go2GaitPublisher {
     ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
     pnh_.param<std::string>("joint_topic", joint_topic, "/joint_states");
 
+    // ==================== 2. 建立 ROS 通信 ====================
+    // 订阅机身里程计以估计运动速度，发布 12 个腿部关节的 JointState。
     odom_sub_ = nh_.subscribe(body_pose_topic, 10, &Go2GaitPublisher::odomCallback, this);
     joint_pub_ = nh_.advertise<sensor_msgs::JointState>(joint_topic, 10);
     timer_ = nh_.createTimer(ros::Duration(1.0 / rate_), &Go2GaitPublisher::timerCallback, this);
 
+    // 初始化关节消息的名称、位置和速度数组。关节顺序必须与 Go2 模型的
+    // 四条腿（FL、FR、RL、RR）及每条腿的 hip/thigh/calf 顺序一致。
     joint_msg_.name = {
         "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
@@ -48,6 +57,9 @@ class Go2GaitPublisher {
 
  private:
   void odomCallback(const nav_msgs::OdometryConstPtr& odom) {
+    // ==================== 3. 从里程计估计水平运动速度 ====================
+    // 优先使用里程计 twist 中的水平速度；当该速度接近零时，再用相邻
+    // 位姿差分估计速度，以兼容只更新位姿而未提供可靠 twist 的仿真输入。
     const double vx = odom->twist.twist.linear.x;
     const double vy = odom->twist.twist.linear.y;
     const double twist_speed = std::sqrt(vx * vx + vy * vy);
@@ -74,6 +86,9 @@ class Go2GaitPublisher {
   }
 
   void timerCallback(const ros::TimerEvent& event) {
+    // ==================== 4. 周期性生成步态关节状态 ====================
+    // 没有里程计或机器人基本静止时发布站立姿态；运动时根据速度比例
+    // 调整摆幅，并为四条腿设置相位差，形成简化的小跑步态。
     if (!has_odom_) {
       publishStance(event.current_real);
       return;
@@ -81,6 +96,7 @@ class Go2GaitPublisher {
 
     const ros::Time stamp = event.current_real;
 
+    // 将当前水平速度归一化到 [0,1]，作为关节摆幅的缩放因子。
     const double speed_ratio =
         always_trot_ ? 0.45 : clamp((horizontal_speed_ - min_walk_speed_) /
                                         std::max(1e-3, max_walk_speed_ - min_walk_speed_),
@@ -91,6 +107,7 @@ class Go2GaitPublisher {
       return;
     }
 
+    // 使用全局时间构造周期相位；对角腿同相、另一对角腿反相。
     const double phase = 2.0 * kPi * gait_frequency_ * stamp.toSec();
     fillLeg(0, phase, speed_ratio, true);
     fillLeg(3, phase + kPi, speed_ratio, false);
@@ -102,6 +119,8 @@ class Go2GaitPublisher {
   }
 
   void publishStance(const ros::Time& stamp) {
+    // ==================== 5. 发布静止站立姿态 ====================
+    // 当没有运动输入时，将四条腿恢复到预设站立关节角，并清零关节速度。
     const std::array<double, 12> stance = {
         0.05, 0.82, -1.58,
         -0.05, 0.82, -1.58,
@@ -118,6 +137,9 @@ class Go2GaitPublisher {
   }
 
   void fillLeg(size_t offset, double phase, double speed_ratio, bool left_side) {
+    // ==================== 6. 生成单腿的周期关节轨迹 ====================
+    // 以正弦/余弦函数分别生成髋、腿和小腿关节摆动；正半周期作为抬腿
+    // 相位，并根据前后腿使用不同站立角。最后对角度和速度进行限幅。
     const double s = std::sin(phase);
     const double c = std::cos(phase);
     const double swing = std::max(0.0, s);
@@ -171,6 +193,7 @@ class Go2GaitPublisher {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // 初始化 ROS 节点并持续处理里程计回调和定时步态发布回调。
   ros::init(argc, argv, "go2_gait_publisher");
   Go2GaitPublisher publisher;
   ros::spin();

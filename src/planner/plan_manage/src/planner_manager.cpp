@@ -332,10 +332,9 @@ namespace scan_planner
   bool SCANPlannerManager::planGlobalTrajWaypoints(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                                   const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
-    // 将导航关键点补齐为适当间距后，生成连续的多段多项式全局参考轨迹。
-
-    // generate global reference trajectory
-
+    // ==================== 1. 检查并组织输入路径点 ====================
+    // waypoints 不包含起点，因此先将当前起点加入 points；随后依次追加
+    // 外部关键点，形成完整的全局路径点序列。
     if (waypoints.empty())
       return false;
 
@@ -347,13 +346,18 @@ namespace scan_planner
       points.push_back(waypoints[wp_i]);
     }
 
+    // ==================== 2. 计算路径总长度和分段阈值 ====================
+    // 总长度用于确定插值尺度。每段最大参考间距取 max(total_len/8, 4 m)，
+    // 既限制单段长度，又避免短路径被过度插值。
     double total_len = 0;
     for (size_t i = 0; i < points.size() - 1; i++)
     {
       total_len += (points[i + 1] - points[i]).norm();
     }
 
-    // insert intermediate points if too far
+    // ==================== 3. 对过长路径段插入中间点 ====================
+    // 对每一段关键点连接线均匀插值，使多项式轨迹不会跨越过长的空间区间。
+    // 这些点属于全局参考轨迹的几何约束，不是局部规划器直接执行的离散路径。
     vector<Eigen::Vector3d> inter_points;
     double dist_thresh = max(total_len / 8, 4.0);
 
@@ -382,12 +386,16 @@ namespace scan_planner
     //   cout << inter_points[i].transpose() << endl;
     // }
 
-    // write position matrix
+    // ==================== 4. 构造多项式求解输入矩阵 ====================
+    // 将插值后的路径点整理为 3×N 矩阵，列向量分别表示各个三维路径点。
     int pt_num = inter_points.size();
     Eigen::MatrixXd pos(3, pt_num);
     for (int i = 0; i < pt_num; ++i)
       pos.col(i) = inter_points[i];
 
+    // ==================== 5. 为每个轨迹段分配初始时间 ====================
+    // 以段长除以最大速度得到初始时间，并放宽首尾段时间，为起步、停车
+    // 以及给定的首尾速度/加速度边界条件提供缓冲。
     Eigen::Vector3d zero(0, 0, 0);
     Eigen::VectorXd time(pt_num - 1);
     for (int i = 0; i < pt_num - 1; ++i)
@@ -398,6 +406,9 @@ namespace scan_planner
     time(0) *= 2.0;
     time(time.rows() - 1) *= 2.0;
 
+    // ==================== 6. 生成连续多项式全局轨迹 ====================
+    // 多个路径点使用 minimum-snap 多段多项式；只有起点和一个终点时，
+    // 使用单段五次多项式。两种情况均施加起点和终点的状态边界条件。
     PolynomialTraj gl_traj;
     if (pos.cols() >= 3)
       gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, end_vel, start_acc, end_acc, time);
@@ -406,6 +417,9 @@ namespace scan_planner
     else
       return false;
 
+    // ==================== 7. 保存轨迹及其时间基准 ====================
+    // 全局轨迹被保存到 GlobalTrajData，供 FSM 投影当前位置、选取局部目标
+    // 以及在局部 B 样条重规划过程中提供路线引导。
     auto time_now = ros::Time::now();
     global_data_.setGlobalTraj(gl_traj, time_now);
 
@@ -415,15 +429,18 @@ namespace scan_planner
   bool SCANPlannerManager::planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                          const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
-    // 在单一终点模式下插入必要的中间点，并生成起点到终点的多项式参考轨迹。
-
-    // generate global reference trajectory
+    // ==================== 1. 初始化全局轨迹的几何约束 ====================
+    // 当前接口用于单一终点导航。将起点和终点组成最初的路径点序列，
+    // 首尾速度和加速度作为多项式轨迹的边界条件传入后续求解。
 
     vector<Eigen::Vector3d> points;
     points.push_back(start_pos);
     points.push_back(end_pos);
 
-    // insert intermediate points if too far
+    // ==================== 2. 对长距离起终点进行分段 ====================
+    // 当起终点距离超过 4 m 时，在两点之间均匀插入中间点。中间点并不
+    // 表示局部规划目标，而是为了避免单段多项式跨度过大、改善全局参考
+    // 轨迹的数值条件和形状控制能力。
     vector<Eigen::Vector3d> inter_points;
     const double dist_thresh = 4.0;
 
@@ -447,12 +464,17 @@ namespace scan_planner
 
     inter_points.push_back(points.back());
 
-    // write position matrix
+    // ==================== 3. 构造多项式轨迹的路径点矩阵 ====================
+    // 将插值后的三维路径点转换为 3×N 矩阵，每一列对应一个路径点，
+    // 该矩阵作为 minimum-snap 或单段五次多项式生成器的输入。
     int pt_num = inter_points.size();
     Eigen::MatrixXd pos(3, pt_num);
     for (int i = 0; i < pt_num; ++i)
       pos.col(i) = inter_points[i];
 
+    // ==================== 4. 按最大速度估计各段时间 ====================
+    // 以相邻路径点距离除以最大速度得到初始段时间。首段和末段额外放大
+    // 时间，为起步和停车阶段的速度、加速度边界约束预留缓冲。
     Eigen::Vector3d zero(0, 0, 0);
     Eigen::VectorXd time(pt_num - 1);
     for (int i = 0; i < pt_num - 1; ++i)
@@ -463,6 +485,9 @@ namespace scan_planner
     time(0) *= 2.0;
     time(time.rows() - 1) *= 2.0;
 
+    // ==================== 5. 选择多项式轨迹生成方式 ====================
+    // 至少有三个路径点时生成多段 minimum-snap 轨迹；只有起点和终点时
+    // 生成单段五次多项式。两种方式都满足给定的首尾状态约束。
     PolynomialTraj gl_traj;
     if (pos.cols() >= 3)
       gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, end_vel, start_acc, end_acc, time);
@@ -471,6 +496,9 @@ namespace scan_planner
     else
       return false;
 
+    // ==================== 6. 保存全局轨迹并建立时间基准 ====================
+    // 全局轨迹不直接作为最终控制指令，而是供 FSM 投影当前位置、选取
+    // 有限视距局部目标，并为后续 B 样条局部规划提供路线引导。
     auto time_now = ros::Time::now();
     global_data_.setGlobalTraj(gl_traj, time_now);
 

@@ -118,8 +118,9 @@ namespace scan_planner
     self_inflation_pub_ = nh.advertise<visualization_msgs::Marker>("self_inflation", 10, true);
 
     // ==================== 8. 按导航模式注册目标输入 ====================
-    // 手动模式接收 RViz 单点目标；预设关键点模式等待初始里程计后启动
-    // 第一段任务；参考路径模式接收外部路径并沿路径进行局部避障。
+    // （1）手动模式接收 RViz 单点目标；
+    // （2）预设关键点模式等待初始里程计后启动第一段任务；
+    // （3）参考路径模式接收外部路径并沿路径进行局部避障。
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = nh.subscribe("/move_base_simple/goal", 1, &SCANReplanFSM::rvizGoalCallback, this);
     else if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
@@ -167,6 +168,8 @@ namespace scan_planner
     if (!msg)
       return;
 
+    // RViz 目标的 z 不作为目标高度；需先由初始机身里程计确定 rviz_goal_height_。
+    // 也就是说rviz模式下，目标高度被设置为初始机身高度 rviz_goal_height_。
     if (!rviz_height_ready_)
     {
       ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
@@ -181,33 +184,47 @@ namespace scan_planner
 
   void SCANReplanFSM::waypointCallback(const nav_msgs::PathConstPtr &msg)
   {
-    // 校验外部目标，生成起点到目标的全局参考轨迹，并通知状态机开始局部规划。
+    // ==================== 1. 校验目标消息 ====================
+    // 该回调同时服务于 RViz 单点目标和统一的 Path 消息输入；当前手动目标
+    // 模式只使用 poses[0]，因此先检查消息指针和路径容器是否为空。
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[waypointCallback] Empty waypoint message, ignore.");
       return;
     }
 
+    // ==================== 2. 过滤无效的 RViz 目标 ====================
+    // RViz 的 2D 目标可能以负 z 表示“高度未设置”；此类消息直接忽略，
+    // 有效目标的 z 统一采用初始机身高度 rviz_goal_height_。
     if (msg->poses[0].pose.position.z < -0.1)
       return;
 
+    // ==================== 3. 设置新任务的起点和触发标志 ====================
+    // 保存收到目标时的当前位置并通知 FSM；后续局部规划仍会在执行时
+    // 根据最新里程计或当前轨迹状态重新确定边界状态。
     cout << "Triggered!" << endl;
     trigger_ = true;
     init_pt_ = odom_pos_;
 
+    // ==================== 4. 构造全局参考轨迹 ====================
+    // RViz 目标只提供平面位置，因此使用初始机身高度构造三维目标，
+    // 避免未定义 z 值导致参考轨迹出现不合理的垂向运动。
     bool success = false;
     end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, rviz_goal_height_;
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
+    // 若目标处于当前双圆柱膨胀地图的占据区域，则沿全局轨迹寻找可用终点。
     if (success)
       success = adjustGlobalTargetIfOccupied();
 
+    // 发布最终采用的目标点，可能是原始目标，也可能是占据修正后的目标。
     visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
 
     if (success)
     {
 
-      /*** display ***/
+      // ==================== 5. 可视化全局参考轨迹 ====================
+      // 以固定时间间隔采样全局多项式轨迹，便于在 RViz 中检查路线是否合理。
       constexpr double step_size_t = 0.1;
       int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
       vector<Eigen::Vector3d> gloabl_traj(i_end);
@@ -220,7 +237,9 @@ namespace scan_planner
       have_target_ = true;
       have_new_target_ = true;
 
-      /*** FSM ***/
+      // ==================== 6. 更新目标状态并切换 FSM ====================
+      // 等待目标状态进入 GEN_NEW_TRAJ；执行已有任务时进入 REPLAN_TRAJ，
+      // 从而保持在线重规划语义。
       if (exec_state_ == WAIT_TARGET)
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
       else if (exec_state_ == EXEC_TRAJ)
@@ -237,22 +256,30 @@ namespace scan_planner
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
   {
-    // 接收外部参考路径或关键点序列，生成全局轨迹并设置当前导航目标。
+    // ==================== 1. 检查路径点数量并确定终点 ====================
+    // 该函数位于 FSM 层，负责将外部路径点交给 Planner Manager，并在
+    // 生成成功后更新当前导航目标和 FSM 任务状态。
     if (waypoints.size() < 2)
     {
       ROS_WARN("[planGlobalTrajByWaypoints] Reference path requires at least two points.");
       return false;
     }
 
+    // 最后一个路径点是当前全局任务的终点，其余点作为中间参考点传入。
     end_pt_ = waypoints.back();
     std::vector<Eigen::Vector3d> reference_waypoints(waypoints.begin() + 1, waypoints.end());
 
+    // ==================== 2. 可视化输入路径点 ====================
+    // 在调用规划器前显示所有输入点，便于检查外部路径坐标和点序列是否正确。
     for (size_t i = 0; i < waypoints.size(); i++)
     {
       visualization_->displayGoalPoint(waypoints[i], Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, i);
       ros::Duration(0.001).sleep();
     }
 
+    // ==================== 3. 请求 Planner Manager 生成全局参考轨迹 ====================
+    // 以零速度和零加速度作为路径两端边界，生成经过这些路径点的连续
+    // 多项式参考轨迹；该轨迹后续用于局部目标选取和局部避障引导。
     bool success = planner_manager_->planGlobalTrajWaypoints(
         waypoints.front(),
         Eigen::Vector3d::Zero(),
@@ -267,9 +294,14 @@ namespace scan_planner
       return false;
     }
 
+    // ==================== 4. 修正当前局部地图中被占据的终点 ====================
+    // 若终点已经进入感知范围且被双圆柱膨胀地图占据，则沿参考轨迹回退
+    // 到最近的安全点，并同步更新全局轨迹时长。
     if (!adjustGlobalTargetIfOccupied())
       return false;
 
+    // ==================== 5. 采样并发布全局路径可视化 ====================
+    // 只对全局轨迹进行采样显示，不将这些离散点直接发送给控制器。
     constexpr double step_size_t = 0.1;
     int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
     std::vector<Eigen::Vector3d> gloabl_traj(i_end);
@@ -278,6 +310,9 @@ namespace scan_planner
       gloabl_traj[i] = planner_manager_->global_data_.global_traj_.evaluate(i * step_size_t);
     }
 
+    // ==================== 6. 更新 FSM 的目标状态 ====================
+    // 标记已有新目标和新的全局参考轨迹；后续 FSM 根据当前状态进入
+    // GEN_NEW_TRAJ 或 REPLAN_TRAJ。
     end_vel_.setZero();
     have_target_ = true;
     have_new_target_ = true;
@@ -289,16 +324,24 @@ namespace scan_planner
 
   bool SCANReplanFSM::planNextWaypoint()
   {
-    // 取当前关键点作为局部导航段终点，并为该关键点刷新全局参考轨迹。
+    // ==================== 1. 检查当前关键点索引 ====================
+    // active_waypoints_ 保存当前任务的关键点序列，current_wp_ 指向即将
+    // 执行的关键点。索引越界通常意味着任务序列已经结束或状态不一致。
     if (current_wp_ < 0 || current_wp_ >= (int)active_waypoints_.size())
     {
       ROS_WARN("[navi_mode=%d] No active waypoint to plan.", navi_mode_);
       return false;
     }
 
+    // ==================== 2. 设置当前关键点和规划起点状态 ====================
+    // 将当前关键点设为全局参考轨迹终点，并从里程计或上一条局部轨迹中
+    // 获取位置、速度和加速度边界，保证切换关键点时轨迹状态尽量连续。
     end_pt_ = active_waypoints_[current_wp_];
     setStartStateFromOdomOrCurrentTraj();
 
+    // ==================== 3. 生成当前关键点的全局参考轨迹 ====================
+    // 全局轨迹只承担路线引导作用，不直接作为最终执行轨迹；后续局部规划器
+    // 将沿该轨迹选取有限视距目标，并根据局部地图进行 B 样条避障优化。
     bool success = planner_manager_->planGlobalTraj(
         start_pt_,
         start_vel_,
@@ -313,9 +356,15 @@ namespace scan_planner
       return false;
     }
 
+    // ==================== 4. 检查并修正被占据的目标 ====================
+    // 若当前局部地图已经观测到关键点被占据，则沿全局轨迹向后寻找最近的
+    // 无碰撞点，并同步截断全局轨迹；找不到安全点时当前关键点规划失败。
     if (!adjustGlobalTargetIfOccupied())
       return false;
 
+    // ==================== 5. 采样和发布全局轨迹可视化 ====================
+    // 以固定时间间隔采样全局多项式轨迹，仅用于 RViz 显示和调试，不改变
+    // 后续局部 B 样条规划的数据结构。
     constexpr double step_size_t = 0.1;
     int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
     std::vector<Eigen::Vector3d> gloabl_traj(i_end);
@@ -324,6 +373,9 @@ namespace scan_planner
       gloabl_traj[i] = planner_manager_->global_data_.global_traj_.evaluate(i * step_size_t);
     }
 
+    // ==================== 6. 更新任务状态 ====================
+    // 当前关键点已有可用全局参考轨迹，通知 FSM 可以进入 GEN_NEW_TRAJ，
+    // 并让局部规划器为该关键点生成第一条可执行 B 样条轨迹。
     end_vel_.setZero();
     have_target_ = true;
     have_new_target_ = true;
@@ -343,21 +395,34 @@ namespace scan_planner
 
   bool SCANReplanFSM::adjustGlobalTargetIfOccupied()
   {
-    // 当全局终点落入当前膨胀地图的占据区域时，沿参考轨迹寻找最近可用终点。
+    // ==================== 1. 获取全局轨迹和地图状态 ====================
+    // 该函数在全局参考轨迹生成后调用，用于检查终点是否落入当前地图中
+    // 的机器人双圆柱膨胀占据区域。
     auto map = planner_manager_->grid_map_;
     auto &global_data = planner_manager_->global_data_;
     const double duration = global_data.global_duration_;
+
+    // 地图尚未准备好或全局轨迹无有效时长时，不执行终点修正，交由后续
+    // 规划流程处理当前状态。
     if (!map || duration < 1e-3)
       return true;
 
+    // ==================== 2. 检查全局轨迹终点 ====================
+    // 按固定时间间隔估计轨迹采样数量，并使用终点前一个采样点到终点
+    // 的水平切线方向作为双圆柱碰撞检测的航向。
     constexpr double sample_dt = 0.05;
     const int sample_num = std::max(1, static_cast<int>(std::ceil(duration / sample_dt)));
     const Eigen::Vector3d final_pt = global_data.global_traj_.evaluate(duration);
     const Eigen::Vector3d final_prev = global_data.global_traj_.evaluate(duration * (sample_num - 1) / sample_num);
     const int final_occ = map->getInflateOccupancy(final_pt, estimateYawFromSegment(final_prev, final_pt));
+
+    // 终点无碰撞时保持原始全局轨迹和终点不变。
     if (final_occ <= 0)
       return true;
 
+    // ==================== 3. 沿轨迹反向搜索可用终点 ====================
+    // 终点被占据时，从终点向起点逐个检查轨迹采样点。每个采样点均使用
+    // 其前一采样点到当前点的切线方向进行航向感知碰撞检查。
     for (int i = sample_num; i >= 0; --i)
     {
       const double t = duration * i / sample_num;
@@ -367,6 +432,9 @@ namespace scan_planner
 
       if (map->getInflateOccupancy(pt, estimateYawFromSegment(prev_pt, pt)) == 0)
       {
+        // ==================== 4. 截断全局轨迹 ====================
+        // 找到最近的无碰撞点后，将其设置为新的全局目标，并同步缩短
+        // 全局轨迹时长和进度记录，保证局部目标选取不会继续越过该点。
         const Eigen::Vector3d raw_end = end_pt_;
         end_pt_ = pt;
         global_data.global_duration_ = t;
@@ -377,13 +445,16 @@ namespace scan_planner
       }
     }
 
+    // 整条全局轨迹均无法找到无碰撞终点，当前导航任务不能安全启动。
     ROS_ERROR("[global target] Target is occupied, and no collision-free point was found along the global trajectory.");
     return false;
   }
 
   void SCANReplanFSM::pathCallback(const nav_msgs::PathConstPtr &msg)
   {
-    // 接收外部参考路径，提取有效路径点并转换为全局参考轨迹。
+    // ==================== 1. 校验外部路径输入 ====================
+    // 参考路径模式由外部模块发布 nav_msgs/Path；消息为空或尚未收到
+    // 里程计时无法建立可靠的全局轨迹，因此直接忽略本次输入。
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[pathCallback] Received empty /initial_path, ignore.");
@@ -396,11 +467,17 @@ namespace scan_planner
       return;
     }
 
+    // ==================== 2. 设置任务终点和触发标志 ====================
+    // 参考路径的最后一个点作为任务终点。路径高度加上 body_height_，
+    // 将外部路径的地面/参考高度转换为机器人机身中心高度。
     trigger_ = true;
     end_pt_ << msg->poses.back().pose.position.x,
         msg->poses.back().pose.position.y,
         msg->poses.back().pose.position.z + body_height_;
 
+    // ==================== 3. 转换并稀疏化路径点 ====================
+    // 将每个 PoseStamped 转换为三维关键点，并删除相邻距离小于 0.5 m
+    // 的冗余点，降低后续多项式生成和局部目标选取的计算负担。
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
     constexpr double min_dist = 0.5;
@@ -422,14 +499,19 @@ namespace scan_planner
       }
     }
 
+    // 确保最终任务终点一定包含在关键点序列中，避免因稀疏化误删末端点。
     if ((waypoints.back() - end_pt_).norm() > 1e-6)
       waypoints.push_back(end_pt_);
 
+    // ==================== 4. 生成全局参考轨迹 ====================
+    // 将整理后的关键点交给统一接口处理；该接口还负责终点占据修正和
+    // 全局路径可视化。
     bool success = planGlobalTrajByWaypoints(waypoints);
 
     if (success)
     {
-      /*** FSM ***/
+      // ==================== 5. 根据当前 FSM 状态触发局部规划 ====================
+      // 没有执行任务时生成第一条局部轨迹；已有轨迹执行时请求在线重规划。
       if (exec_state_ == WAIT_TARGET)
       {
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
@@ -865,24 +947,39 @@ namespace scan_planner
 
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
   {
-    // 优先使用当前执行轨迹在当前时刻的速度和加速度作为新规划边界；
-    // 在没有有效局部轨迹时退化为直接使用里程计状态。
+    // ==================== 1. 使用里程计建立默认边界状态 ====================
+    // 位置和速度首先采用最新里程计，起始加速度默认置零。这样即使当前
+    // 没有有效的局部轨迹，新任务也能够从当前机器人状态开始规划。
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
     LocalTrajData *info = &planner_manager_->local_data_;
+    // ==================== 2. 检查当前局部轨迹是否可用于续接 ====================
+    // start_time_ 和 duration_ 均接近零时，说明尚未发布过有效局部轨迹，
+    // 保留上面的里程计边界并直接返回。
     if (info->start_time_.toSec() < 1e-5 || info->duration_ <= 1e-5)
       return;
 
+    // ==================== 3. 计算当前轨迹执行时间 ====================
+    // 根据系统时钟与局部轨迹起始时间的差值定位当前执行点。若时间明显
+    // 超出轨迹生命周期，说明轨迹已经失效，不能再用其导数作为边界状态。
     const double raw_t_cur = (ros::Time::now() - info->start_time_).toSec();
     if (raw_t_cur < -1e-3 || raw_t_cur > info->duration_ + 0.2)
       return;
 
+    // 将轻微的数值误差裁剪到合法时间区间内。
     const double t_cur = std::min(std::max(raw_t_cur, 0.0), info->duration_);
+
+    // ==================== 4. 从局部轨迹提取连续状态 ====================
+    // 使用当前 B 样条的一阶、二阶导数作为新轨迹的速度和加速度边界，
+    // 从而避免重规划时速度和加速度突然跳变。
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
+    // ==================== 5. 处理背离目标方向的速度 ====================
+    // 若当前水平速度与机器人到目标的方向相反，则清零速度和加速度，
+    // 避免将明显不利于到达目标的运动状态传给新的局部规划器。
     const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
     if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
     {
