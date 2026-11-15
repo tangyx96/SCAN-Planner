@@ -15,6 +15,8 @@ namespace scan_planner
   void UniformBspline::setUniformBspline(const Eigen::MatrixXd &points, const int &order,
                                          const double &interval)
   {
+    // 初始化控制点、样条次数、节点向量和节点间隔；后续求导和可行性检查
+    // 均基于该参数化。
     control_points_ = points;
     p_ = order;
     interval_ = interval;
@@ -41,12 +43,15 @@ namespace scan_planner
     }
   }
 
+  // 设置外部提供的节点向量，通常用于从规划消息恢复轨迹。
   void UniformBspline::setKnot(const Eigen::VectorXd &knot) { this->u_ = knot; }
 
+  // 返回当前节点向量，供消息发布和轨迹重建使用。
   Eigen::VectorXd UniformBspline::getKnot() { return this->u_; }
 
   bool UniformBspline::getTimeSpan(double &um, double &um_p)
   {
+    // 返回 B 样条有效参数区间的起止节点，排除两端无效节点区间。
     if (p_ > u_.rows() || m_ - p_ > u_.rows())
       return false;
 
@@ -56,10 +61,12 @@ namespace scan_planner
     return true;
   }
 
+  // 返回当前控制点矩阵的副本。
   Eigen::MatrixXd UniformBspline::getControlPoint() { return control_points_; }
 
   Eigen::VectorXd UniformBspline::evaluateDeBoor(const double &u)
   {
+    // 使用 De Boor 算法在给定节点参数处计算 B 样条值。
 
     double ub = min(max(u_(p_), u), u_(m_ - p_));
 
@@ -99,6 +106,7 @@ namespace scan_planner
 
   Eigen::MatrixXd UniformBspline::getDerivativeControlPoints()
   {
+    // 根据节点差分构造一阶导数控制点。
     // The derivative of a b-spline is also a b-spline, its order become p_-1
     // control point Qi = p_*(Pi+1-Pi)/(ui+p_+1-ui+1)
     Eigen::MatrixXd ctp(control_points_.rows(), control_points_.cols() - 1);
@@ -112,6 +120,7 @@ namespace scan_planner
 
   UniformBspline UniformBspline::getDerivative()
   {
+    // 构造并返回当前 B 样条的一阶导数轨迹。
     Eigen::MatrixXd ctp = getDerivativeControlPoints();
     UniformBspline derivative(ctp, p_ - 1, interval_);
 
@@ -123,10 +132,12 @@ namespace scan_planner
     return derivative;
   }
 
+  // 返回相邻均匀节点之间的时间间隔。
   double UniformBspline::getInterval() { return interval_; }
 
   void UniformBspline::setPhysicalLimits(const double &vel, const double &acc, const double &tolerance)
   {
+    // 设置速度、加速度上限及可行性检查允许的相对容差。
     limit_vel_ = vel;
     limit_acc_ = acc;
     feasibility_tolerance_ = tolerance;
@@ -134,6 +145,7 @@ namespace scan_planner
 
   bool UniformBspline::checkFeasibility(double &ratio, bool show)
   {
+    // 利用导数控制点检查速度和加速度上界，并返回建议的时间缩放比例。
     bool fea = true;
 
     Eigen::MatrixXd P = control_points_;
@@ -194,6 +206,7 @@ namespace scan_planner
 
   void UniformBspline::lengthenTime(const double &ratio)
   {
+    // 按给定比例拉伸内部节点时间，从而降低轨迹速度和加速度。
     int num1 = 5;
     int num2 = getKnot().rows() - 1 - 5;
 
@@ -211,6 +224,8 @@ namespace scan_planner
                                              const vector<Eigen::Vector3d> &start_end_derivative,
                                              Eigen::MatrixXd &ctrl_pts)
   {
+    // 将离散路径点和首尾边界导数约束转换为三次均匀 B 样条控制点，
+    // 作为后续 rebound 优化的初始解。
     if (ts <= 0)
     {
       cout << "[B-spline]:time step error." << endl;
@@ -281,6 +296,7 @@ namespace scan_planner
 
   double UniformBspline::getTimeSum()
   {
+    // 返回有效 B 样条参数区间对应的总执行时间。
     double tm, tmp;
     if (getTimeSpan(tm, tmp))
       return tmp - tm;
@@ -290,6 +306,7 @@ namespace scan_planner
 
   double UniformBspline::getLength(const double &res)
   {
+    // 以固定时间间隔采样，近似计算轨迹弧长。
     double length = 0.0;
     double dur = getTimeSum();
     Eigen::VectorXd p_l = evaluateDeBoorT(0.0), p_n;
@@ -304,6 +321,7 @@ namespace scan_planner
 
   double UniformBspline::getJerk()
   {
+    // 构造三阶导数轨迹并计算 jerk 二次代价。
     UniformBspline jerk_traj = getDerivative().getDerivative().getDerivative();
 
     Eigen::VectorXd times = jerk_traj.getKnot();
@@ -324,6 +342,7 @@ namespace scan_planner
 
   void UniformBspline::getMeanAndMaxVel(double &mean_v, double &max_v)
   {
+    // 对速度轨迹采样，统计速度范数的均值和最大值。
     UniformBspline vel = getDerivative();
     double tm, tmp;
     vel.getTimeSpan(tm, tmp);
@@ -350,6 +369,7 @@ namespace scan_planner
 
   void UniformBspline::getMeanAndMaxAcc(double &mean_a, double &max_a)
   {
+    // 对加速度轨迹采样，统计加速度范数的均值和最大值。
     UniformBspline acc = getDerivative().getDerivative();
     double tm, tmp;
     acc.getTimeSpan(tm, tmp);

@@ -7,6 +7,7 @@ using namespace Eigen;
 
 AStar::~AStar()
 {
+    // 释放三维节点池，避免每次搜索重建节点时产生堆内存泄漏。
     for (int i = 0; i < POOL_SIZE_(0); i++)
         for (int j = 0; j < POOL_SIZE_(1); j++)
             for (int k = 0; k < POOL_SIZE_(2); k++)
@@ -15,6 +16,7 @@ AStar::~AStar()
 
 void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
+    // 绑定占据地图并分配固定尺寸节点池；节点状态通过搜索轮次复用。
     POOL_SIZE_ = pool_size;
     CENTER_IDX_ = pool_size / 2;
 
@@ -37,6 +39,7 @@ void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 
 double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
 {
+    // 计算允许三维对角移动时的距离启发式值。
     double dx = abs(node1->index(0) - node2->index(0));
     double dy = abs(node1->index(1) - node2->index(1));
     double dz = abs(node1->index(2) - node2->index(2));
@@ -64,6 +67,7 @@ double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
 
 double AStar::getManhHeu(GridNodePtr node1, GridNodePtr node2)
 {
+    // 计算节点间的曼哈顿距离启发式值。
     double dx = abs(node1->index(0) - node2->index(0));
     double dy = abs(node1->index(1) - node2->index(1));
     double dz = abs(node1->index(2) - node2->index(2));
@@ -73,11 +77,13 @@ double AStar::getManhHeu(GridNodePtr node1, GridNodePtr node2)
 
 double AStar::getEuclHeu(GridNodePtr node1, GridNodePtr node2)
 {
+    // 计算节点间的欧氏距离启发式值。
     return (node2->index - node1->index).norm();
 }
 
 vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
 {
+    // 沿 cameFrom 指针从终点回溯到起点，形成反向节点序列。
     vector<GridNodePtr> path;
     path.push_back(current);
 
@@ -92,6 +98,7 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
 
 bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx)
 {
+    // 将端点转换为栅格索引；若端点位于障碍中，则沿路径方向寻找相邻自由索引。
     if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
         return false;
 
@@ -144,6 +151,8 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
 
 ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
 {
+    // 在入口和出口高度之间构造线性插值搜索面。A* 只扩展水平八邻域，
+    // 每个邻居的 z 索引由其在起终点连线方向上的投影比例确定。
     ros::Time time_1 = ros::Time::now();
     ++rounds_;
 
@@ -250,6 +259,7 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
 
                 neighborPtr->rounds = rounds_;
 
+                // 邻居扩展方向同时作为双圆柱机身碰撞检查的候选航向。
                 const double neighbor_yaw = std::atan2(static_cast<double>(dy), static_cast<double>(dx));
                 if (checkOccupancy(Index2Coord(neighborPtr->index), neighbor_yaw))
                 {
@@ -257,6 +267,8 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
                 }
 
                 const int dz = neighborIdx(2) - current->index(2);
+                // 使用三维栅格位移长度作为边代价，使坡面或楼梯上的高度变化
+                // 反映在搜索代价中。
                 double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
                 tentative_gScore = current->gScore + static_cost;
 
@@ -294,6 +306,7 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
 
 vector<Vector3d> AStar::getPath()
 {
+    // 将最近一次搜索的节点序列转换为世界坐标，并调整为起点到终点的顺序。
     vector<Vector3d> path;
 
     for (auto ptr : gridPath_)

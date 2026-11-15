@@ -8,6 +8,7 @@ namespace scan_planner
   {
     void applyLinearZReference(std::vector<Eigen::Vector3d> &points, const double start_z, const double target_z)
     {
+      // 按水平累计弧长重新设置采样点高度，保留平面路径形状并形成稳定的垂向参考。
       if (points.empty())
         return;
 
@@ -46,6 +47,8 @@ namespace scan_planner
 
   void SCANPlannerManager::initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis)
   {
+    // 初始化局部地图、B 样条优化器和 A* 搜索器。三个模块共享同一个
+    // GridMap，使碰撞查询、搜索和执行期安全检查使用一致的环境状态。
     /* read algorithm parameters */
 
     nh.param("manager/max_vel", pp_.max_vel_, -1.0);
@@ -78,6 +81,8 @@ namespace scan_planner
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
                                         Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
   {
+    // 单次局部规划主流程：生成或续接初始路径，构造 B 样条，检测碰撞段，
+    // 通过 A* 生成 rebound 引导，优化控制点，并在必要时重新分配时间。
 
     static int count = 0;
     std::cout << endl
@@ -96,7 +101,7 @@ namespace scan_planner
     ros::Time t_start = ros::Time::now();
     ros::Duration t_init, t_opt, t_refine;
 
-    /*** STEP 1: INIT ***/
+    /*** STEP 1: INIT：生成局部规划初值并确定 B 样条时间间隔。 ***/
     double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     static bool flag_first_call = true, flag_force_polynomial = false;
@@ -243,12 +248,14 @@ namespace scan_planner
       }
     } while (flag_regenerate);
 
+    // 按水平累计弧长重建高度参考，抑制不必要的垂向绕障和高度振荡。
     applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
 
     Eigen::MatrixXd ctrl_pts;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
 
     vector<vector<Eigen::Vector3d>> a_star_paths;
+    // 检测初始 B 样条的碰撞段，并为每个碰撞段搜索局部无碰撞引导路径。
     a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
 
     t_init = ros::Time::now() - t_start;
@@ -259,7 +266,7 @@ namespace scan_planner
 
     t_start = ros::Time::now();
 
-    /*** STEP 2: OPTIMIZE ***/
+    /*** STEP 2: OPTIMIZE：优化 rebound、安全、平滑和可行性代价。 ***/
     bool flag_step_1_success = bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
@@ -273,7 +280,7 @@ namespace scan_planner
     t_opt = ros::Time::now() - t_start;
     t_start = ros::Time::now();
 
-    /*** STEP 3: REFINE(RE-ALLOCATE TIME) IF NECESSARY ***/
+    /*** STEP 3: REFINE：若速度或加速度超限，则重新分配时间并再次检查。 ***/
     UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);
     pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
 
@@ -310,6 +317,7 @@ namespace scan_planner
 
   bool SCANPlannerManager::EmergencyStop(Eigen::Vector3d stop_pos)
   {
+    // 生成所有控制点均位于 stop_pos 的静止 B 样条，用于紧急停止并保持当前位置。
     Eigen::MatrixXd control_points(3, 6);
     for (int i = 0; i < 6; i++)
     {
@@ -324,6 +332,7 @@ namespace scan_planner
   bool SCANPlannerManager::planGlobalTrajWaypoints(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                                   const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
+    // 将导航关键点补齐为适当间距后，生成连续的多段多项式全局参考轨迹。
 
     // generate global reference trajectory
 
@@ -406,6 +415,7 @@ namespace scan_planner
   bool SCANPlannerManager::planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                          const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
+    // 在单一终点模式下插入必要的中间点，并生成起点到终点的多项式参考轨迹。
 
     // generate global reference trajectory
 
@@ -469,6 +479,7 @@ namespace scan_planner
 
   bool SCANPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points)
   {
+    // 根据可行性检查得到的时间缩放比例重新参数化轨迹，再执行 refine 优化。
     double t_inc;
 
     Eigen::MatrixXd ctrl_pts; // = traj.getControlPoint()
@@ -490,6 +501,7 @@ namespace scan_planner
 
   void SCANPlannerManager::updateTrajInfo(const UniformBspline &position_traj, const ros::Time time_now)
   {
+    // 保存局部位置轨迹及其一阶、二阶导数，并更新执行起始时间、持续时间和轨迹编号。
     local_data_.start_time_ = time_now;
     local_data_.position_traj_ = position_traj;
     local_data_.velocity_traj_ = local_data_.position_traj_.getDerivative();
@@ -501,6 +513,7 @@ namespace scan_planner
 
   bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)
   {
+    // 对最终轨迹按时间采样，检查速度和加速度范数是否满足执行上限。
     UniformBspline vel_traj = position_traj.getDerivative();
     UniformBspline acc_traj = vel_traj.getDerivative();
     const double duration = position_traj.getTimeSum();
@@ -534,6 +547,7 @@ namespace scan_planner
   void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,
                                          Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc)
   {
+    // 延长或缩短 B 样条时间尺度，重新采样轨迹并生成新的控制点。
     double time_origin = bspline.getTimeSum();
     int seg_num = bspline.getControlPoint().cols() - 3;
     // double length = bspline.getLength(0.1);

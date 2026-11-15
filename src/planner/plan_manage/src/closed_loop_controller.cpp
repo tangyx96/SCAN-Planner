@@ -17,8 +17,10 @@ namespace
 {
 using scan_planner::UniformBspline;
 
+// 对角速度设置统一的安全上限，防止参数配置导致过大的原地旋转指令。
 constexpr double kMaxVYawLimit = 1.0;
 
+// ROS 通信对象：分别用于发布速度指令、执行冻结状态，并接收轨迹和里程计。
 ros::Publisher cmd_vel_pub;
 ros::Publisher execution_frozen_pub;
 ros::Subscriber bspline_sub;
@@ -27,6 +29,7 @@ ros::Timer cmd_timer;
 
 bool receive_traj = false;
 bool have_odom = false;
+// traj[0]、traj[1]、traj[2] 分别保存位置、速度和加速度 B 样条。
 std::vector<UniformBspline> traj;
 double traj_duration = 0.0;
 int traj_id = 0;
@@ -49,6 +52,7 @@ std::string body_pose_topic;
 
 bool loadRequiredParam(const ros::NodeHandle &nh, const std::string &name, double &value)
 {
+  // 读取必须存在的私有参数，缺少关键参数时拒绝启动控制器。
   if (nh.getParam(name, value))
     return true;
 
@@ -58,6 +62,7 @@ bool loadRequiredParam(const ros::NodeHandle &nh, const std::string &name, doubl
 
 bool loadParams(const ros::NodeHandle &nh)
 {
+  // 集中读取控制器参数，并对最大 yaw 速度施加额外的安全限幅。
   bool ok = true;
   ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
   ok &= loadRequiredParam(nh, "time_forward", time_forward);
@@ -78,6 +83,7 @@ bool loadParams(const ros::NodeHandle &nh)
 
 double normalizeAngle(double angle)
 {
+  // 将角度归一化到 [-pi, pi]，避免航向误差跨越边界时产生跳变。
   while (angle > M_PI)
     angle -= 2.0 * M_PI;
   while (angle < -M_PI)
@@ -87,11 +93,13 @@ double normalizeAngle(double angle)
 
 double clamp(double value, double min_value, double max_value)
 {
+  // 将标量控制量限制在给定上下界内。
   return std::max(min_value, std::min(max_value, value));
 }
 
 Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double max_norm)
 {
+  // 按向量范数进行限幅，保持速度方向不变，避免分别限幅造成方向偏差。
   const double norm = value.norm();
   if (norm <= max_norm || norm < 1e-6)
     return value;
@@ -100,6 +108,8 @@ Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double max_norm)
 
 double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des)
 {
+  // 用前视点与期望位置的水平连线估计期望航向；局部位移过小时退化为
+  // 轨迹速度方向，仍不足时保持当前里程计航向。
   const double t_look = std::min(traj_duration, t_cur + time_forward);
   Eigen::Vector3d dir = traj[0].evaluateDeBoorT(t_look) - pos_des;
 
@@ -117,6 +127,7 @@ double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des)
 
 void publishStop(double vyaw = 0.0)
 {
+  // 发布零平移速度，并保留经过限幅的角速度，用于原地转向或安全停止。
   geometry_msgs::Twist cmd;
   cmd.angular.z = clamp(vyaw, -max_vyaw, max_vyaw);
   cmd_vel_pub.publish(cmd);
@@ -124,6 +135,7 @@ void publishStop(double vyaw = 0.0)
 
 void publishExecutionFrozen(bool frozen)
 {
+  // 通知规划状态机是否暂停局部轨迹的时间推进。
   std_msgs::Bool msg;
   msg.data = frozen;
   execution_frozen_pub.publish(msg);
@@ -131,9 +143,12 @@ void publishExecutionFrozen(bool frozen)
 
 void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
 {
+  // 将规划器发布的控制点和节点向量重建为位置、速度和加速度 B 样条。
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
   Eigen::VectorXd knots(msg->knots.size());
 
+  // 将 ROS 消息中的控制点和节点向量恢复为 UniformBspline，随后由样条求导
+  // 获得速度和加速度轨迹。新轨迹到达后从执行时间零点重新开始跟踪。
   for (size_t i = 0; i < msg->knots.size(); ++i)
     knots(i) = msg->knots[i];
 
@@ -163,6 +178,7 @@ void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
 
 void odomCallback(const nav_msgs::OdometryConstPtr &msg)
 {
+  // 保存当前机身位置和 yaw，作为位置误差反馈及机体系速度变换的测量值。
   odom_pos(0) = msg->pose.pose.position.x;
   odom_pos(1) = msg->pose.pose.position.y;
   odom_pos(2) = msg->pose.pose.position.z;
@@ -172,8 +188,10 @@ void odomCallback(const nav_msgs::OdometryConstPtr &msg)
 
 void cmdCallback(const ros::TimerEvent &)
 {
+  // 按当前执行时间连续查询轨迹状态，并向下游控制接口发布期望指令。
   if (!receive_traj || !have_odom)
   {
+    // 在轨迹或里程计尚未准备好时不推进执行时间，并发布安全停止指令。
     publishExecutionFrozen(false);
     publishStop();
     return;
@@ -185,6 +203,8 @@ void cmdCallback(const ros::TimerEvent &)
     dt = 0.0;
 
   const double t_eval = std::min(exec_time, traj_duration);
+  // 先在当前执行时刻计算期望状态和航向误差。若航向偏差过大，
+  // 控制器只允许原地转向，不让轨迹时间继续前进。
   Eigen::Vector3d pos_des = traj[0].evaluateDeBoorT(t_eval);
   Eigen::Vector3d vel_des = traj[1].evaluateDeBoorT(t_eval);
 
@@ -201,6 +221,7 @@ void cmdCallback(const ros::TimerEvent &)
   }
 
   publishExecutionFrozen(false);
+  // 航向满足要求后推进执行时间，并重新查询与实际控制周期对应的期望状态。
   exec_time = std::min(traj_duration, exec_time + dt);
   last_update_time = now;
 
@@ -227,6 +248,7 @@ void cmdCallback(const ros::TimerEvent &)
 
 int main(int argc, char **argv)
 {
+  // 初始化 ROS 节点、读取控制参数、建立通信接口，并以 100 Hz 运行控制回调。
   ros::init(argc, argv, "closed_loop_controller");
   ros::NodeHandle node;
   ros::NodeHandle nh("~");

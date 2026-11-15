@@ -363,6 +363,8 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 }
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
+  // 将机器人中心和航向转换为前、后两个圆柱中心，并查询膨胀占据缓冲区。
+  // 该接口是规划器和执行期安全检查共用的整机碰撞判定入口。
   Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
   Eigen::Vector3d front = pos + mp_.double_cylinder_offset_ * heading;
   Eigen::Vector3d rear = pos - mp_.double_cylinder_offset_ * heading;

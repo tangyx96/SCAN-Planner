@@ -6,6 +6,8 @@
 
 void GridMap::initMap(ros::NodeHandle &nh)
 {
+  // 读取地图、传感器、占据概率、滑动窗口和双圆柱膨胀参数，并初始化
+  // 固定容量的体素缓冲区。后续感知回调只更新该局部地图窗口。
   node_ = nh;
 
   /* get parameter */
@@ -179,6 +181,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
 
 void GridMap::updateMapBoundaryFromIndex()
 {
+  // 根据地图原点索引和体素数量刷新全局边界，供坐标转换和滑动窗口使用。
   mp_.map_bound_min_idx_ = mp_.map_origin_idx_ - mp_.map_voxel_num_ / 2;
   mp_.map_bound_max_idx_ = mp_.map_bound_min_idx_ + mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 
@@ -189,6 +192,7 @@ void GridMap::updateMapBoundaryFromIndex()
 
 void GridMap::rebuildInflationOffsets()
 {
+  // 根据双圆柱半径及上下膨胀范围生成增量膨胀所需的体素偏移集合。
   const double double_radius = std::max(0.0, mp_.double_cylinder_radius_);
   const int inf_step_xy = ceil(double_radius / mp_.resolution_);
   const int inf_step_z_up = ceil(mp_.obstacles_inflation_z_up / mp_.resolution_);
@@ -209,6 +213,7 @@ void GridMap::rebuildInflationOffsets()
 
 void GridMap::resetAllMapData()
 {
+  // 清空占据、膨胀、射线统计和缓存状态，将地图恢复为未知环境。
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
   std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
@@ -222,6 +227,7 @@ void GridMap::resetAllMapData()
 
 void GridMap::hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const
 {
+  // 将环形缓冲区地址还原为对应的全局体素索引。
   Eigen::Vector3i id_l;
   id_l(0) = addr / (mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2));
   id_l(1) = (addr - id_l(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2)) / mp_.map_voxel_num_(2);
@@ -244,6 +250,7 @@ void GridMap::updateInflationLayer(const Eigen::Vector3i& id, int delta,
                                    std::vector<char>& flag_buffer,
                                    const std::vector<char>* ignore_mask)
 {
+  // 对占据状态变化的体素更新其膨胀影响范围内的计数和占据标志。
   for (const auto& offset : offsets)
   {
     const Eigen::Vector3i inf_id = id + offset;
@@ -263,12 +270,14 @@ void GridMap::updateInflationLayer(const Eigen::Vector3i& id, int delta,
 
 void GridMap::updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask)
 {
+  // 使用当前地图配置的膨胀偏移集合更新局部膨胀缓冲区。
   updateInflationLayer(id, delta, md_.inflate_offsets_, md_.occupancy_buffer_inflate_cnt_,
                        md_.occupancy_buffer_inflate_, ignore_mask);
 }
 
 void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds)
 {
+  // 写入体素 log-odds；占据状态发生变化时同步维护膨胀层。
   if (!isInMap(id))
     return;
 
@@ -283,6 +292,7 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odd
 
 void GridMap::resetCellByAddress(int addr)
 {
+  // 清除指定缓冲区地址的占据和射线统计，并撤销其对膨胀层的贡献。
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
   if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
@@ -297,6 +307,7 @@ void GridMap::resetCellByAddress(int addr)
 
 void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask)
 {
+  // 地图滑动时撤销移出区域的膨胀影响，同时跳过仍被重叠区域使用的地址。
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
   if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
@@ -305,6 +316,7 @@ void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& cl
 
 void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
 {
+  // 根据机器人中心平移环形地图窗口，仅重置移出区域并复用其存储地址。
   if (!mp_.map_sliding_en_)
     return;
 
@@ -404,6 +416,7 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
 
 void GridMap::resetBuffer()
 {
+  // 将整个局部地图缓冲区重置为未知状态。
   resetAllMapData();
   md_.local_bound_min_ = mp_.map_bound_min_idx_;
   md_.local_bound_max_ = mp_.map_bound_max_idx_;
@@ -411,6 +424,7 @@ void GridMap::resetBuffer()
 
 void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
 {
+  // 仅重置给定空间范围内的体素，用于局部地图清理。
   Eigen::Vector3i min_id, max_id;
   posToIndex(min_pos, min_id);
   posToIndex(max_pos, max_id);
@@ -430,6 +444,7 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
 
 int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 {
+  // 将单次观测写入临时命中/未命中统计，等待 raycastProcess 批量融合。
   if (occ != 1 && occ != 0)
     return INVALID_IDX;
 
@@ -455,6 +470,7 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 
 void GridMap::projectDepthImage()
 {
+  // 按相机内外参将深度像素投影到世界坐标系，并执行距离筛选。
   // md_.proj_points_.clear();
   md_.proj_points_cnt = 0;
 
@@ -523,6 +539,7 @@ void GridMap::projectDepthImage()
 
 void GridMap::raycastProcess()
 {
+  // 从传感器原点到观测点执行体素射线更新，融合自由空间和障碍证据。
   // if (md_.proj_points_.size() == 0)
   if (md_.proj_points_cnt == 0)
     return;
@@ -690,6 +707,7 @@ void GridMap::raycastProcess()
 
 Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen::Vector3d &ray_pos)
 {
+  // 将射线终点裁剪到当前地图边界内，避免射线访问窗口外的体素。
   Eigen::Vector3d diff = pt - ray_pos;
   Eigen::Vector3d max_tc = mp_.map_max_boundary_ - ray_pos;
   Eigen::Vector3d min_tc = mp_.map_min_boundary_ - ray_pos;
@@ -716,6 +734,7 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::visCallback(const ros::TimerEvent & /*event*/)
 {
+  // 定时发布占据、膨胀、滑动窗口和点云可视化结果。
 
   publishMap();
   publishMapInflate(true);
@@ -726,6 +745,7 @@ void GridMap::visCallback(const ros::TimerEvent & /*event*/)
 
 void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
 {
+  // 定时执行深度投影或点云融合，并更新局部占据地图。
   if (!md_.occ_need_update_)
     return;
 
@@ -758,6 +778,7 @@ void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
 void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
                                 const nav_msgs::OdometryConstPtr &pose)
 {
+  // 同步接收深度图和传感器位姿，保存后续投影与射线更新所需的状态。
   if (mp_.sensor_type_ != "depth")
     return;
 
@@ -820,6 +841,7 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
 
 void GridMap::sensorPoseCallback(const nav_msgs::OdometryConstPtr &pose_msg)
 {
+  // 更新激光传感器射线原点和姿态，并触发滑动地图中心更新。
   if (mp_.sensor_type_ != "lidar")
     return;
 
@@ -849,12 +871,14 @@ void GridMap::sensorPoseCallback(const nav_msgs::OdometryConstPtr &pose_msg)
 
 void GridMap::slidingMapFrameCallback(const nav_msgs::OdometryConstPtr &pose)
 {
+  // 更新滑动地图坐标系的可视化位姿。
   const geometry_msgs::Point &pos = pose->pose.pose.position;
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
 }
 
 void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
 {
+  // 接收点云、执行必要的坐标处理和边界过滤，并设置待融合标志。
   if (mp_.sensor_type_ != "lidar")
     return;
 
@@ -922,6 +946,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
 
 void GridMap::publishMap()
 {
+  // 将当前已占据体素转换为 PointCloud2 并发布原始占据地图。
 
   if (map_pub_.getNumSubscribers() <= 0)
     return;
@@ -961,6 +986,7 @@ void GridMap::publishMap()
 
 void GridMap::publishMapInflate(bool all_info)
 {
+  // 发布膨胀后的占据体素；all_info 决定是否包含完整局部窗口信息。
 
   if (map_inf_pub_.getNumSubscribers() <= 0)
     return;
@@ -1004,6 +1030,7 @@ void GridMap::publishMapInflate(bool all_info)
 
 void GridMap::publishSlidingMapFrame()
 {
+  // 发布滑动地图坐标系相对于全局坐标系的 TF 变换。
   if (mp_.sliding_map_frame_id_.empty())
     return;
 
@@ -1017,6 +1044,7 @@ void GridMap::publishSlidingMapFrame()
 
 void GridMap::publishSlidingMapBBox()
 {
+  // 发布滑动地图的三维边界框，辅助检查局部窗口位置和大小。
   if (sliding_map_bbox_pub_.getNumSubscribers() <= 0)
     return;
 
@@ -1072,6 +1100,7 @@ void GridMap::publishSlidingMapBBox()
 
 void GridMap::publishUnknown()
 {
+  // 发布当前地图中的未知体素区域，用于可视化感知范围和地图覆盖状态。
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
 
@@ -1122,6 +1151,7 @@ Eigen::Vector3d GridMap::getOrigin() { return mp_.map_origin_; }
 
 void GridMap::getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size)
 {
+  // 返回当前局部地图的原点和物理尺寸。
   ori = mp_.map_origin_, size = mp_.map_size_;
 }
 
@@ -1129,6 +1159,7 @@ void GridMap::getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size)
 
 void GridMap::publishDepthCloud()
 {
+  // 发布深度图投影得到的点云，用于检查传感器投影和地图更新结果。
   if (depth_cloud_pub_.getNumSubscribers() <= 0)
     return;
 

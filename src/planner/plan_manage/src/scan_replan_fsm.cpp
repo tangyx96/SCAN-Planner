@@ -25,6 +25,9 @@ namespace scan_planner
 
   void SCANReplanFSM::init(ros::NodeHandle &nh)
   {
+    // ==================== 1. 初始化状态与运行标志 ====================
+    // 将状态机置于 INIT 状态，清空目标、里程计、重规划失败和执行冻结等
+    // 标志，保证节点启动时不会继承未定义的任务状态。
     current_wp_ = 0;
     exec_state_ = FSM_EXEC_STATE::INIT;
     trigger_ = false;
@@ -38,7 +41,9 @@ namespace scan_planner
     replan_fail_count_ = 0;
     last_freeze_update_time_ = ros::Time::now();
 
-    /*  fsm param  */
+    // ==================== 2. 读取 FSM、地图和机身碰撞参数 ====================
+    // FSM 参数决定导航模式、局部规划视距、重规划时机和失败保护策略；
+    // 地图参数用于发布机器人自身的双圆柱膨胀可视化范围。
     nh.param("fsm/navi_mode", navi_mode_, -1);
     nh.param("fsm/thresh_replan", replan_thresh_, -1.0);
     nh.param("fsm/thresh_no_replan", no_replan_thresh_, -1.0);
@@ -53,6 +58,9 @@ namespace scan_planner
     nh.param("grid_map/body_height", body_height_, 0.0);
     nh.param("grid_map/frame_id", self_inflation_frame_id_, std::string("world"));
 
+    // ==================== 3. 加载预设关键点 ====================
+    // 仅在多关键点导航模式下读取 tools/keypoint.yaml，并将每个关键点
+    // 解析为后续逐段规划使用的三维目标坐标。
     if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
     {
       const std::string keypoints_yaml = "\"$(rospack find scan_planner)/../../../tools/keypoint.yaml\"";
@@ -82,24 +90,36 @@ namespace scan_planner
       }
     }
 
-    /* initialize main modules */
+    // ==================== 4. 初始化规划与可视化模块 ====================
+    // 创建 RViz 可视化对象和规划管理器；规划管理器内部进一步初始化
+    // GridMap、B 样条优化器以及 A* 搜索器。
     visualization_.reset(new PlanningVisualization(nh));
     planner_manager_.reset(new SCANPlannerManager);
     planner_manager_->initPlanModules(nh, visualization_);
 
-    /* callback */
+    // ==================== 5. 创建规划与安全检查定时器 ====================
+    // 规划状态机以 100 Hz 运行，安全检查以 20 Hz 运行。二者分离可以在
+    // 轨迹执行期间持续检查新障碍，而不改变主状态机的时序结构。
     exec_timer_ = nh.createTimer(ros::Duration(0.01), &SCANReplanFSM::execFSMCallback, this);
     safety_timer_ = nh.createTimer(ros::Duration(0.05), &SCANReplanFSM::checkCollisionCallback, this);
 
+    // ==================== 6. 注册状态输入和执行反馈订阅 ====================
+    // 里程计提供规划起点、当前执行状态和航向估计；执行冻结反馈用于在
+    // 闭环控制器原地调整航向时暂停局部轨迹时间推进。
     std::string body_pose_topic;
     ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
     odom_sub_ = nh.subscribe(body_pose_topic, 1, &SCANReplanFSM::odometryCallback, this);
     go2_execution_frozen_sub_ = nh.subscribe("/planning/go2_execution_frozen", 10, &SCANReplanFSM::go2ExecutionFrozenCallback, this);
 
+    // ==================== 7. 注册规划结果和调试信息发布器 ====================
+    // B 样条消息发送给控制器，DataDisp 和自身膨胀标记用于调试与可视化。
     bspline_pub_ = nh.advertise<scan_planner::Bspline>("/planning/bspline", 10);
     data_disp_pub_ = nh.advertise<scan_planner::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::Marker>("self_inflation", 10, true);
 
+    // ==================== 8. 按导航模式注册目标输入 ====================
+    // 手动模式接收 RViz 单点目标；预设关键点模式等待初始里程计后启动
+    // 第一段任务；参考路径模式接收外部路径并沿路径进行局部避障。
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = nh.subscribe("/move_base_simple/goal", 1, &SCANReplanFSM::rvizGoalCallback, this);
     else if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
@@ -117,6 +137,7 @@ namespace scan_planner
 
   void SCANReplanFSM::planGlobalTrajbyGivenWps()
   {
+    // 显示预设关键点，保存当前关键点序列，并触发第一个关键点的全局参考轨迹生成。
     std::vector<Eigen::Vector3d> wps = preset_waypoints_;
 
     for (size_t i = 0; i < wps.size(); i++)
@@ -142,6 +163,7 @@ namespace scan_planner
 
   void SCANReplanFSM::rvizGoalCallback(const geometry_msgs::PoseStampedConstPtr &msg)
   {
+    // 将 RViz 单点目标转换为统一的 Path 消息格式，再交由 waypointCallback 处理。
     if (!msg)
       return;
 
@@ -159,6 +181,7 @@ namespace scan_planner
 
   void SCANReplanFSM::waypointCallback(const nav_msgs::PathConstPtr &msg)
   {
+    // 校验外部目标，生成起点到目标的全局参考轨迹，并通知状态机开始局部规划。
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[waypointCallback] Empty waypoint message, ignore.");
@@ -214,6 +237,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
   {
+    // 接收外部参考路径或关键点序列，生成全局轨迹并设置当前导航目标。
     if (waypoints.size() < 2)
     {
       ROS_WARN("[planGlobalTrajByWaypoints] Reference path requires at least two points.");
@@ -265,6 +289,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::planNextWaypoint()
   {
+    // 取当前关键点作为局部导航段终点，并为该关键点刷新全局参考轨迹。
     if (current_wp_ < 0 || current_wp_ >= (int)active_waypoints_.size())
     {
       ROS_WARN("[navi_mode=%d] No active waypoint to plan.", navi_mode_);
@@ -312,11 +337,13 @@ namespace scan_planner
 
   bool SCANReplanFSM::isWaypointSequenceMode() const
   {
+    // 判断当前导航模式是否由多个预设关键点组成。
     return navi_mode_ == NAVI_MODE::PRESET_TARGET;
   }
 
   bool SCANReplanFSM::adjustGlobalTargetIfOccupied()
   {
+    // 当全局终点落入当前膨胀地图的占据区域时，沿参考轨迹寻找最近可用终点。
     auto map = planner_manager_->grid_map_;
     auto &global_data = planner_manager_->global_data_;
     const double duration = global_data.global_duration_;
@@ -356,6 +383,7 @@ namespace scan_planner
 
   void SCANReplanFSM::pathCallback(const nav_msgs::PathConstPtr &msg)
   {
+    // 接收外部参考路径，提取有效路径点并转换为全局参考轨迹。
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[pathCallback] Received empty /initial_path, ignore.");
@@ -421,6 +449,7 @@ namespace scan_planner
 
   void SCANReplanFSM::odometryCallback(const nav_msgs::OdometryConstPtr &msg)
   {
+    // 更新机器人位置、速度、姿态和初始高度状态，为规划边界和航向估计提供数据。
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -449,11 +478,13 @@ namespace scan_planner
 
   void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::BoolConstPtr &msg)
   {
+    // 接收控制器执行冻结状态，防止规划时间在机器人暂停时继续推进。
     go2_execution_frozen_ = msg->data;
   }
 
   void SCANReplanFSM::updateLocalTrajTimeFreeze()
   {
+    // 根据执行冻结状态修正局部轨迹起始时间，使轨迹时间与实际执行进度保持一致。
     const ros::Time now = ros::Time::now();
     double dt = (now - last_freeze_update_time_).toSec();
     last_freeze_update_time_ = now;
@@ -468,6 +499,7 @@ namespace scan_planner
 
   double SCANReplanFSM::getOdomYaw() const
   {
+    // 从当前里程计姿态提取机器人水平航向角。
     Eigen::Vector3d heading = odom_orient_.toRotationMatrix().col(0);
     if (heading.head<2>().squaredNorm() < 1e-8)
       return 0.0;
@@ -476,6 +508,7 @@ namespace scan_planner
 
   double SCANReplanFSM::estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const
   {
+    // 根据轨迹线段水平投影估计航向；水平位移过小时退化为里程计航向。
     Eigen::Vector2d diff(to(0) - from(0), to(1) - from(1));
     if (diff.squaredNorm() < 1e-8)
       return getOdomYaw();
@@ -484,6 +517,7 @@ namespace scan_planner
 
   void SCANReplanFSM::publishSelfInflationMarker()
   {
+    // 发布当前机器人双圆柱膨胀范围，供 RViz 检查碰撞模型和参数设置。
     const double radius = std::max(0.0, self_double_cylinder_radius_);
     const double z_up = std::max(0.0, self_inflation_z_up_);
     const double z_down = std::max(0.0, self_inflation_z_down_);
@@ -527,6 +561,7 @@ namespace scan_planner
 
   void SCANReplanFSM::changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call)
   {
+    // 记录状态切换来源并更新当前状态，便于诊断规划失败和重复重规划。
 
     if (new_state == exec_state_)
       continuously_called_times_++;
@@ -541,11 +576,13 @@ namespace scan_planner
 
   std::pair<int, SCANReplanFSM::FSM_EXEC_STATE> SCANReplanFSM::timesOfConsecutiveStateCalls()
   {
+    // 返回当前状态连续执行次数及状态枚举，用于区分首次规划和重复失败重试。
     return std::pair<int, FSM_EXEC_STATE>(continuously_called_times_, exec_state_);
   }
 
   void SCANReplanFSM::printFSMExecState()
   {
+    // 将状态枚举转换为可读字符串并输出当前 FSM 状态。
     static string state_str[7] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP"};
 
     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
@@ -553,6 +590,8 @@ namespace scan_planner
 
   void SCANReplanFSM::execFSMCallback(const ros::TimerEvent &e)
   {
+    // 状态机主循环：在 INIT、等待目标、生成轨迹、执行、重规划和紧急停止
+    // 之间切换。每次回调只推进当前状态，避免规划流程阻塞 ROS 回调线程。
     updateLocalTrajTimeFreeze();
 
     static int fsm_num = 0;
@@ -744,6 +783,7 @@ namespace scan_planner
 
   void SCANReplanFSM::finishProcess()
   {
+    // 处理连续重规划失败：超过阈值后进入紧急停止并等待新的导航目标。
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
       ROS_WARN("Replan failed %d times. Emergency stop and wait for a new target.", replan_fail_count_);
@@ -756,6 +796,8 @@ namespace scan_planner
 
   bool SCANReplanFSM::planFromCurrentTraj()
   {
+    // 从当前执行时刻重建规划边界。参考路径模式沿当前 B 样条续接，
+    // 目标点模式则先刷新到目标的全局参考轨迹，再生成新的局部轨迹。
     LocalTrajData *info = &planner_manager_->local_data_;
     ros::Time time_now = ros::Time::now();
     double t_cur = (time_now - info->start_time_).toSec();
@@ -823,6 +865,8 @@ namespace scan_planner
 
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
   {
+    // 优先使用当前执行轨迹在当前时刻的速度和加速度作为新规划边界；
+    // 在没有有效局部轨迹时退化为直接使用里程计状态。
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
     start_acc_.setZero();
@@ -849,6 +893,8 @@ namespace scan_planner
 
   void SCANReplanFSM::checkCollisionCallback(const ros::TimerEvent &e)
   {
+    // 沿待执行轨迹采样，并使用与规划阶段一致的航向感知双圆柱模型检查
+    // 新出现的障碍；根据剩余时间选择重规划或紧急停止。
     updateLocalTrajTimeFreeze();
 
     LocalTrajData *info = &planner_manager_->local_data_;
@@ -896,6 +942,8 @@ namespace scan_planner
 
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
+    // 获取有限视距局部目标，调用规划管理器完成一次 rebound 规划，
+    // 成功后将 B 样条控制点和节点向量封装为 ROS 消息发布。
 
     getLocalTarget();
 
@@ -944,6 +992,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
   {
+    // 请求规划管理器生成静止轨迹，并按正常 B 样条消息格式发布给控制器。
 
     planner_manager_->EmergencyStop(stop_pos);
 
@@ -980,6 +1029,8 @@ namespace scan_planner
 
   void SCANReplanFSM::getLocalTarget()
   {
+    // 在全局参考轨迹上投影当前起点，并沿路线前进 planning_horizon 得到局部目标；
+    // 若目标被占据，则在参考轨迹附近寻找可用替代点。
     const double max_vel = planner_manager_->pp_.max_vel_;
     const double max_acc = planner_manager_->pp_.max_acc_;
     const double duration = planner_manager_->global_data_.global_duration_;

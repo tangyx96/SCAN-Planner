@@ -17,6 +17,7 @@ namespace scan_planner
   {
   private:
   public:
+    // 保存全局参考轨迹和局部 B 样条轨迹，并维护二者之间的时间映射。
     PolynomialTraj global_traj_;
     vector<UniformBspline> local_traj_;
 
@@ -205,6 +206,7 @@ namespace scan_planner
 
   struct LocalTrajData
   {
+    // 保存当前执行周期的局部位置、速度和加速度轨迹及其时间边界。
     /* info of generated traj */
 
     int traj_id_;

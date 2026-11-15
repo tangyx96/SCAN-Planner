@@ -15,6 +15,7 @@ using scan_planner::UniformBspline;
 
 namespace
 {
+// 开环节点只发布按 B 样条时间参数计算得到的状态，不根据实际位置误差修正。
 ros::Publisher odom_pub;
 
 bool receive_traj = false;
@@ -34,6 +35,7 @@ Eigen::Vector3d current_vel = Eigen::Vector3d::Zero();
 void publishState(const ros::Time& stamp, const Eigen::Vector3d& pos, const Eigen::Vector3d& vel,
                   double yaw, double yaw_rate)
 {
+  // 将轨迹采样得到的位置、速度、航向和航向角速度封装为模拟里程计消息。
   nav_msgs::Odometry odom;
   odom.header.stamp = stamp;
   odom.header.frame_id = frame_id;
@@ -54,6 +56,7 @@ void publishState(const ros::Time& stamp, const Eigen::Vector3d& pos, const Eige
 
 bool parseBspline(const scan_planner::BsplineConstPtr& msg, UniformBspline& pos_traj)
 {
+  // 校验并解析规划器发布的控制点和节点向量，恢复位置 B 样条对象。
   if (msg->pos_pts.empty() || msg->knots.empty() || msg->order <= 0)
   {
     ROS_WARN("[open_loop_controller] Ignore invalid bspline.");
@@ -79,6 +82,7 @@ bool parseBspline(const scan_planner::BsplineConstPtr& msg, UniformBspline& pos_
 
 void bsplineCallback(const scan_planner::BsplineConstPtr& msg)
 {
+  // 接收新轨迹，构造位置、速度和加速度 B 样条，并记录其全局起始时间。
   UniformBspline pos_traj;
   if (!parseBspline(msg, pos_traj))
     return;
@@ -98,10 +102,12 @@ void bsplineCallback(const scan_planner::BsplineConstPtr& msg)
 
 void publishOdom(const ros::TimerEvent&)
 {
+  // 按当前时刻与轨迹起始时间的差值查询轨迹状态，并发布开环里程计。
   const ros::Time now = ros::Time::now();
 
   if (!receive_traj)
   {
+    // 尚未收到轨迹时保持初始化状态，不生成虚假的运动状态。
     publishState(now, current_pos, current_vel, last_yaw, 0.0);
     return;
   }
@@ -117,6 +123,7 @@ void publishOdom(const ros::TimerEvent&)
     return;
 
   const double t = std::min(std::max(elapsed, 0.0), traj_duration);
+  // 对轨迹时间进行边界裁剪；轨迹结束后可选择保持最终位置。
   Eigen::Vector3d pos = traj[0].evaluateDeBoorT(t);
   Eigen::Vector3d vel = Eigen::Vector3d::Zero();
   Eigen::Vector3d acc = Eigen::Vector3d::Zero();
@@ -128,6 +135,7 @@ void publishOdom(const ros::TimerEvent&)
   }
 
   const double horizontal_speed = std::hypot(vel.x(), vel.y());
+  // 用水平速度方向定义 yaw；速度过小时保持上一次航向，避免噪声放大。
   if (horizontal_speed > yaw_min_speed)
     last_yaw = std::atan2(vel.y(), vel.x());
 
@@ -144,6 +152,7 @@ void publishOdom(const ros::TimerEvent&)
 
 int main(int argc, char** argv)
 {
+  // 初始化开环状态发布节点，读取轨迹、坐标系、初始状态和发布频率参数。
   ros::init(argc, argv, "open_loop_controller");
 
   ros::NodeHandle nh;

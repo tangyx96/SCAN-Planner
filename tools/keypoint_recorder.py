@@ -18,19 +18,23 @@ except ImportError as exc:
     sys.exit(2)
 
 
+# 默认将记录结果保存到当前脚本所在目录下的 keypoint.yaml。
 DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keypoint.yaml")
 
 
 def strip_ros_args(argv):
+    # 移除 ROS 启动时自动注入的参数，仅保留脚本自身的命令行参数。
     return [arg for arg in argv if ":=" not in arg and not arg.startswith("__")]
 
 
 def format_float(value):
+    # 将浮点数格式化为紧凑的 YAML 文本，去除无意义的末尾零。
     text = "{:.6f}".format(float(value)).rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
 
 
 def atomic_write(path, content):
+    # 通过临时文件和原子替换写入内容，避免中断时生成不完整配置文件。
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
@@ -42,7 +46,10 @@ def atomic_write(path, content):
 
 
 class KeypointRecorder:
+    # 订阅里程计并通过键盘维护三维导航关键点列表。
+
     def __init__(self, args):
+        # 初始化输入话题、输出路径、关键点缓存和里程计订阅器。
         self.odom_topic = args.odom
         self.output_path = DEFAULT_OUTPUT
         self.latest_odom = None
@@ -51,9 +58,11 @@ class KeypointRecorder:
         rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
 
     def odom_callback(self, msg):
+        # 保存最新里程计消息，供键盘操作触发时读取当前位置。
         self.latest_odom = msg
 
     def current_point(self):
+        # 提取最新里程计中的位置，并过滤尚未收到或包含非有限值的坐标。
         if self.latest_odom is None:
             return None
 
@@ -62,6 +71,7 @@ class KeypointRecorder:
         return point if all(math.isfinite(value) for value in point) else None
 
     def record_current(self):
+        # 将当前机器人位置追加到关键点序列末尾。
         point = self.current_point()
         if point is None:
             rospy.logwarn("No valid odometry yet; cannot record waypoint.")
@@ -77,6 +87,7 @@ class KeypointRecorder:
         )
 
     def replace_current(self, index):
+        # 用当前机器人位置替换指定编号的关键点；编号从 1 开始。
         if index < 1 or index > len(self.waypoints):
             rospy.logwarn("Invalid waypoint index %d. Valid range: 1-%d.", index, len(self.waypoints))
             return
@@ -96,6 +107,7 @@ class KeypointRecorder:
         )
 
     def delete_waypoint(self, index):
+        # 删除指定编号的关键点，并保持其余关键点的相对顺序。
         if index < 1 or index > len(self.waypoints):
             rospy.logwarn("Invalid waypoint index %d. Valid range: 1-%d.", index, len(self.waypoints))
             return
@@ -110,6 +122,7 @@ class KeypointRecorder:
         )
 
     def undo_last(self):
+        # 删除最近一次记录的关键点，相当于撤销最后一次追加操作。
         if not self.waypoints:
             rospy.logwarn("No waypoint to undo.")
             return
@@ -124,6 +137,7 @@ class KeypointRecorder:
         )
 
     def list_waypoints(self):
+        # 按记录顺序输出当前关键点列表及其三维坐标。
         if not self.waypoints:
             rospy.loginfo("No recorded waypoints.")
             return
@@ -133,6 +147,7 @@ class KeypointRecorder:
             rospy.loginfo("  %02d: [%.3f, %.3f, %.3f]", index, point[0], point[1], point[2])
 
     def build_yaml(self):
+        # 将内存中的关键点转换为 SCAN-Planner 约定的 ROS 参数 YAML 格式。
         lines = ["fsm:", "  waypoint_num: {}".format(len(self.waypoints))]
         for index, point in enumerate(self.waypoints):
             lines.append("  waypoint{}_x: {}".format(index, format_float(point[0])))
@@ -141,10 +156,12 @@ class KeypointRecorder:
         return "\n".join(lines) + "\n"
 
     def save(self):
+        # 生成 YAML 文本并写入默认配置文件。
         atomic_write(self.output_path, self.build_yaml())
         rospy.loginfo("Saved %d waypoint(s) to %s", len(self.waypoints), self.output_path)
 
     def print_help(self):
+        # 打印里程计话题、输出文件和键盘命令说明。
         print("")
         print("keypoint_recorder")
         print("  odom topic : {}".format(self.odom_topic))
@@ -162,6 +179,7 @@ class KeypointRecorder:
         print("")
 
     def prompt_index(self, old_settings, action):
+        # 临时恢复规范终端输入，读取用户指定的关键点编号后恢复即时输入模式。
         if not self.waypoints:
             rospy.logwarn("No waypoint to %s.", action)
             return None
@@ -180,6 +198,7 @@ class KeypointRecorder:
             tty.setcbreak(sys.stdin.fileno())
 
     def run(self):
+        # 运行键盘事件循环，并以 20 Hz 维持 ROS 回调处理和终端轮询。
         self.print_help()
         rospy.loginfo("Waiting for odometry on %s ...", self.odom_topic)
 
@@ -229,12 +248,14 @@ class KeypointRecorder:
 
 
 def build_arg_parser():
+    # 创建命令行参数解析器，允许用户覆盖默认里程计话题。
     parser = argparse.ArgumentParser(description="Record odometry positions to tools/keypoint.yaml.")
     parser.add_argument("--odom", default="/LIO/odom_vehicle", help="nav_msgs/Odometry topic to record.")
     return parser
 
 
 def main():
+    # 解析参数、初始化 ROS 节点并启动关键点记录器。
     parser = build_arg_parser()
     args = parser.parse_args(strip_ros_args(sys.argv[1:]))
 

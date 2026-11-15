@@ -9,6 +9,7 @@ namespace scan_planner
 
   void BsplineOptimizer::setParam(ros::NodeHandle &nh)
   {
+    // 读取平滑性、碰撞、安全距离和动力学可行性相关参数。
     nh.param("optimization/lambda_smooth", lambda1_, -1.0);
     nh.param("optimization/lambda_collision", lambda2_, -1.0);
     nh.param("optimization/lambda_feasibility", lambda3_, -1.0);
@@ -23,11 +24,13 @@ namespace scan_planner
 
   void BsplineOptimizer::setEnvironment(const GridMap::Ptr &env)
   {
+    // 设置碰撞检测和 A* 搜索所使用的共享三维占据地图。
     this->grid_map_ = env;
   }
 
   double BsplineOptimizer::estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const
   {
+    // 使用线段在水平面的投影估计机体航向；垂向分量不参与 yaw 计算。
     Eigen::Vector2d diff(to(0) - from(0), to(1) - from(1));
     if (diff.squaredNorm() < 1e-8)
       return 0.0;
@@ -36,6 +39,7 @@ namespace scan_planner
 
   double BsplineOptimizer::estimateControlPointYaw(const Eigen::MatrixXd &q, int id) const
   {
+    // 以控制点前后邻域的有限差分近似局部切线方向，避免引入独立 yaw 变量。
     if (q.cols() <= 1)
       return 0.0;
 
@@ -46,9 +50,11 @@ namespace scan_planner
 
   void BsplineOptimizer::setControlPoints(const Eigen::MatrixXd &points)
   {
+    // 设置当前待优化的 B 样条控制点矩阵。
     cps_.points = points;
   }
 
+  // 设置 B 样条节点间隔，决定控制点差分对应的时间尺度。
   void BsplineOptimizer::setBsplineInterval(const double &ts) { bspline_interval_ = ts; }
 
   /* This function is very similar to check_collision_and_rebound(). 
@@ -56,6 +62,8 @@ namespace scan_planner
    * But I will merge then someday.*/
   std::vector<std::vector<Eigen::Vector3d>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
+    // 检查初始控制点轨迹，分割连续碰撞区段，并为每个区段调用投影 A*。
+    // A* 路径仅用于构造 rebound 几何约束，最终轨迹仍由连续优化器生成。
 
     if (flag_first_init)
     {
@@ -64,7 +72,7 @@ namespace scan_planner
       cps_.points = init_points;
     }
 
-    /*** Segment the initial trajectory according to obstacles ***/
+    /*** 根据航向感知的双圆柱碰撞查询分割初始轨迹。 ***/
     constexpr int ENOUGH_INTERVAL = 2;
     double step_size = grid_map_->getResolution() / ((init_points.col(0) - init_points.rightCols(1)).norm() / (init_points.cols() - 1)) / 2;
     int in_id = -1, out_id = -1;
@@ -124,7 +132,7 @@ namespace scan_planner
       }
     }
 
-    /*** a star search ***/
+    /*** 对每个碰撞区段搜索高度插值曲面上的局部无碰撞路径。 ***/
     vector<vector<Eigen::Vector3d>> a_star_paths;
     for (size_t i = 0; i < segment_ids.size(); ++i)
     {
@@ -148,7 +156,7 @@ namespace scan_planner
       }
     }
 
-    /*** calculate bounds ***/
+    /*** 计算各碰撞区段对应的控制点作用范围，避免相邻区段互相覆盖。 ***/
     int id_low_bound, id_up_bound;
     vector<std::pair<int, int>> bounds(segment_ids.size());
     for (size_t i = 0; i < segment_ids.size(); i++)
@@ -212,7 +220,7 @@ namespace scan_planner
       //cout << "final:" << "i = " << i << " first = " << final_segment_ids[i].first << " second = " << final_segment_ids[i].second << endl;
     }
 
-    /*** Assign data to each segment ***/
+    /*** 将 A* 路径转换为控制点的基准点和回弹方向。 ***/
     for (size_t i = 0; i < segment_ids.size(); i++)
     {
       if (i >= a_star_paths.size() || a_star_paths[i].size() < 2)
@@ -365,6 +373,7 @@ namespace scan_planner
 
   int BsplineOptimizer::earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls)
   {
+    // L-BFGS 回调：当检测到新碰撞或不可恢复错误时终止当前优化调用。
     BsplineOptimizer *opt = reinterpret_cast<BsplineOptimizer *>(func_data);
     // cout << "k=" << k << endl;
     // cout << "opt->flag_continue_to_optimize_=" << opt->flag_continue_to_optimize_ << endl;
@@ -373,6 +382,7 @@ namespace scan_planner
 
   double BsplineOptimizer::costFunctionRebound(void *func_data, const double *x, double *grad, const int n)
   {
+    // 将 L-BFGS 变量映射回控制点，并计算 rebound 阶段的总代价与梯度。
     BsplineOptimizer *opt = reinterpret_cast<BsplineOptimizer *>(func_data);
 
     double cost;
@@ -384,6 +394,7 @@ namespace scan_planner
 
   double BsplineOptimizer::costFunctionRefine(void *func_data, const double *x, double *grad, const int n)
   {
+    // 计算 refine 阶段的平滑性、参考轨迹拟合和动力学可行性代价。
     BsplineOptimizer *opt = reinterpret_cast<BsplineOptimizer *>(func_data);
 
     double cost;
@@ -396,6 +407,7 @@ namespace scan_planner
   void BsplineOptimizer::calcDistanceCostRebound(const Eigen::MatrixXd &q, double &cost,
                                                  Eigen::MatrixXd &gradient, int iter_num, double smoothness_cost)
   {
+    // 根据 A* 构造的基准点和回弹方向，对安全距离不足的控制点计算代价和梯度。
     cost = 0.0;
     int end_idx = q.cols() - order_;
     double demarcation = cps_.clearance;
@@ -436,6 +448,7 @@ namespace scan_planner
 
   void BsplineOptimizer::calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
+    // 计算当前轨迹与参考采样点之间的拟合代价及其控制点梯度。
 
     cost = 0.0;
 
@@ -467,6 +480,7 @@ namespace scan_planner
   void BsplineOptimizer::calcSmoothnessCost(const Eigen::MatrixXd &q, double &cost,
                                             Eigen::MatrixXd &gradient, bool falg_use_jerk /* = true*/)
   {
+    // 计算 jerk 或加速度差分平方和，并将梯度分配到相邻控制点。
 
     cost = 0.0;
 
@@ -508,6 +522,7 @@ namespace scan_planner
   void BsplineOptimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
                                              Eigen::MatrixXd &gradient)
   {
+    // 对速度和加速度超过上限的控制点施加单边惩罚，并计算对应梯度。
 
     //#define SECOND_DERIVATIVE_CONTINOUS
 
@@ -711,10 +726,12 @@ namespace scan_planner
 
   bool BsplineOptimizer::check_collision_and_rebound(void)
   {
+    // 在优化迭代过程中重新检查当前控制点轨迹。若出现新碰撞，则重新
+    // 搜索局部绕障路径并更新 rebound 约束；无碰撞时允许优化正常结束。
 
     int end_idx = cps_.size - order_;
 
-    /*** Check and segment the initial trajectory according to obstacles ***/
+    /*** 检查控制点并分割当前轨迹中的新增碰撞区段。 ***/
     int in_id, out_id;
     vector<std::pair<int, int>> segment_ids;
     bool flag_new_obs_valid = false;
@@ -787,7 +804,7 @@ namespace scan_planner
       vector<vector<Eigen::Vector3d>> a_star_paths;
       for (size_t i = 0; i < segment_ids.size(); ++i)
       {
-        /*** a star search ***/
+        /*** 对新增碰撞区段执行 A* 搜索。 ***/
         Eigen::Vector3d in(cps_.points.col(segment_ids[i].first)), out(cps_.points.col(segment_ids[i].second));
         ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
         if (ret == ASTAR_RET::SUCCESS)
@@ -817,7 +834,7 @@ namespace scan_planner
         }
       }
 
-      /*** Assign parameters to each segment ***/
+      /*** 根据 A* 路径更新受影响控制点的回弹基准点和方向。 ***/
       for (size_t i = 0; i < segment_ids.size(); ++i)
       {
         if (i >= a_star_paths.size() || a_star_paths[i].size() < 2)
@@ -929,6 +946,7 @@ namespace scan_planner
 
   bool BsplineOptimizer::BsplineOptimizeTrajRebound(Eigen::MatrixXd &optimal_points, double ts)
   {
+    // 优化入口。rebound_optimize() 修改内部控制点，完成后将结果写回调用方。
     setBsplineInterval(ts);
 
     bool flag_success = rebound_optimize();
@@ -940,6 +958,7 @@ namespace scan_planner
 
   bool BsplineOptimizer::BsplineOptimizeTrajRefine(const Eigen::MatrixXd &init_points, const double ts, Eigen::MatrixXd &optimal_points)
   {
+    // 在已生成的轨迹基础上执行不重新搜索拓扑的二次优化。
 
     setControlPoints(init_points);
     setBsplineInterval(ts);
@@ -953,6 +972,8 @@ namespace scan_planner
 
   bool BsplineOptimizer::rebound_optimize()
   {
+    // 使用 L-BFGS 优化内部控制点。首尾 order 个控制点固定，仅优化中间控制点；
+    // 求解过程中会复查碰撞，必要时重新生成 rebound 方向并重启优化。
     iter_num_ = 0;
     int start_id = order_;
     int end_id = this->cps_.size - order_;
@@ -1060,6 +1081,7 @@ namespace scan_planner
 
   bool BsplineOptimizer::refine_optimize()
   {
+    // 执行 refine 阶段的 L-BFGS 优化，并在优化后复查轨迹碰撞。
     iter_num_ = 0;
     int start_id = order_;
     int end_id = this->cps_.points.cols() - order_;
@@ -1132,6 +1154,7 @@ namespace scan_planner
 
   void BsplineOptimizer::combineCostRebound(const double *x, double *grad, double &f_combine, const int n)
   {
+    // 组合 rebound 阶段的平滑、碰撞和动力学代价；z 方向梯度按设计被抑制。
 
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
@@ -1157,6 +1180,7 @@ namespace scan_planner
 
   void BsplineOptimizer::combineCostRefine(const double *x, double *grad, double &f_combine, const int n)
   {
+    // 组合 refine 阶段的平滑、参考拟合和动力学代价，并输出变量梯度。
 
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
