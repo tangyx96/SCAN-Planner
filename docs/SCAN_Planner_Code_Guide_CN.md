@@ -2,7 +2,7 @@
 
 ## 1. 文档定位
 
-本文说明 SCAN-Planner 仓库的软件结构、关键调用链、主要函数职责、论文概念与代码实现的对应关系，以及推荐的代码阅读顺序。算法模型与公式推导见[《方法原理与系统框架》](SCAN_Planner_Overview_CN.md)；轨迹执行和 Go2 仿真见[《控制器与仿真说明》](SCAN_Planner_Controller_and_Simulation_CN.md)。
+本文说明 SCAN-Planner 的软件结构、关键调用链、主要函数职责、论文概念与代码实现的对应关系，以及代码阅读顺序。算法模型与公式推导见[《方法原理与系统框架》](SCAN_Planner_Overview_CN.md)，轨迹执行与 Go2 仿真见[《控制器与仿真说明》](SCAN_Planner_Controller_and_Simulation_CN.md)，固定全局参考轨迹任务的执行流程见[《固定全局参考轨迹任务的执行与局部避障流程》](SCAN_Planner_Fixed_Global_Trajectory_Flow_CN.md)。
 
 ## 2. 仓库代码结构
 
@@ -75,7 +75,7 @@ SCAN-Planner/
 - `lbfgs.hpp`：L-BFGS 求解器实现；
 - `gradient_descent_optimizer.*`：仓库保留的另一优化器实现。
 
-阅读时不应首先深入 `lbfgs.hpp`。理解本项目所定义的变量、目标函数和梯度组合，比研究通用求解器内部细节更重要。
+不宜从 `lbfgs.hpp` 开始阅读。对于本项目，变量定义、目标函数和梯度组合比通用求解器的内部实现更为关键。
 
 ### 2.5 `traj_utils`：轨迹初始化与可视化层
 
@@ -146,11 +146,11 @@ callReboundReplan
 
 #### 目标与路径输入
 
-`SCANReplanFSM::rvizGoalCallback()` 接收 RViz 发布的单个 `geometry_msgs::PoseStamped` 目标。函数首先检查消息指针和初始机身高度是否有效，再将单点目标包装为只有一个元素的 `nav_msgs::Path`，随后复用 `waypointCallback()` 的统一处理流程。这样可以避免为单目标输入和多航点输入分别维护两套规划逻辑。
+现有实现中的 `SCANReplanFSM::rvizGoalCallback()` 接收单个 `geometry_msgs::PoseStamped` 目标，并将其包装为单元素 `nav_msgs::Path`，随后复用 `waypointCallback()`。在项目正式接口中，该处理逻辑应由 Action goal 回调调用；RViz 订阅仅作为现有示例入口。
 
-`SCANReplanFSM::pathCallback()` 接收包含一个或多个位姿的 `nav_msgs::Path`。函数负责检查路径消息的有效性、提取各个位姿的位置，并将其转换为规划器使用的三维航点序列。路径中的高度信息不能被任意解释为有效机身状态：代码会结合初始高度是否已经建立以及输入高度的合法性进行筛选。对于 RViz 目标中出现的异常负高度，例如 `z < -0.1` 的情况，函数直接拒绝该输入，主要用于过滤 RViz 未设置高度、消息初始化异常或明显不符合当前机器人工作空间的目标，而不是执行目标修正。
+`SCANReplanFSM::pathCallback()` 接收包含一个或多个位姿的 `nav_msgs::Path`。函数负责检查路径消息的有效性、提取各个位姿的位置，并将其转换为规划器使用的三维航点序列。路径中的高度信息不能被任意解释为有效机身状态：代码会结合初始高度是否已经建立以及输入高度的合法性进行筛选。对于单点目标中出现的异常负高度，例如 `z < -0.1`，函数直接拒绝该输入，用于过滤未设置高度、消息初始化异常或超出机器人工作空间的目标；该判断不承担目标修正功能。
 
-`rviz_height_ready_` 表示系统是否已经收到可作为参考的初始机身高度。若该标志尚未建立，状态机不会接受 RViz 目标，因为此时无法可靠地判断目标高度、规划起点高度以及后续高度插值是否一致。
+`rviz_height_ready_` 表示系统是否已经收到可作为参考的初始机身高度。若该标志尚未建立，状态机不会接受依赖该高度的单点目标，因为此时无法可靠地确定目标高度、规划起点高度以及后续高度插值。
 
 #### 全局航点轨迹生成
 
