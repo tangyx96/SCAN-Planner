@@ -218,14 +218,16 @@ setStartStateFromOdomOrCurrentTraj();
 callReboundReplan(true, flag_random_poly_init);
 ```
 
-首次规划通常使用当前里程计建立规划边界。局部规划过程包括：
+`setStartStateFromOdomOrCurrentTraj()` 以当前里程计位置作为起点，默认采用里程计速度和零加速度。若已有局部轨迹通过有效性与执行时间检查，则采用其当前执行时刻的速度和加速度；若该水平速度背离目标，则将速度和加速度清零。局部规划过程包括：
 
 1. `getLocalTarget()`：从全局参考轨迹选取有限视距目标；
-2. `reboundReplan()`：生成初始轨迹并执行局部优化；
+2. `reboundReplan()`：生成多项式初始轨迹，经采样和参数化得到 B 样条初始控制点；
 3. 地图碰撞查询和碰撞段检测；
 4. projected A* 搜索和 rebound 几何约束构造；
 5. 平滑性、碰撞安全和动力学可行性优化；
 6. 可行性检查并发布 `/planning/bspline`。
+
+首次进入 `GEN_NEW_TRAJ` 时，`flag_random_poly_init` 为 `false`，采用单段五次多项式构造初值。初值生成不施加碰撞约束，后续流程负责绕障与可行性检查。
 
 规划成功后：
 
@@ -233,7 +235,7 @@ callReboundReplan(true, flag_random_poly_init);
 GEN_NEW_TRAJ → EXEC_TRAJ
 ```
 
-如果失败，则在 `GEN_NEW_TRAJ` 中重试；连续失败超过阈值后进入 `EMERGENCY_STOP`。
+若局部规划失败，则再次进入 `GEN_NEW_TRAJ`，将 `flag_random_poly_init` 设为 `true`，通过随机偏移中间点生成 minimum-snap 初值并重新规划。连续失败超过阈值后进入 `EMERGENCY_STOP`。
 
 ## 8. 正常执行：`EXEC_TRAJ`
 
@@ -263,7 +265,11 @@ EXEC_TRAJ
 EXEC_TRAJ → REPLAN_TRAJ
 ```
 
-随后调用 `planFromCurrentTraj()`，从当前局部 B 样条中提取当前时刻的位置、速度和加速度，使新轨迹能够与当前运动连续衔接。
+随后由 `planFromCurrentTraj()` 设置起始状态，并通过 `callReboundReplan()` 完成局部规划与轨迹发布。
+
+在 `REFERENCE_PATH` 模式下，起始位置、速度和加速度均取自当前局部 B 样条。在 RViz 单点目标模式下，起始位置取当前里程计，速度和加速度取当前局部轨迹；若水平速度背离目标，则将速度和加速度清零。该模式随后刷新全局参考轨迹，与项目固定全局参考轨迹要求的差异见第 10 节。
+
+`planFromCurrentTraj()` 直接将执行时间裁剪至轨迹区间后取值；旧轨迹的有效性检查及里程计回退处理仅由 `GEN_NEW_TRAJ` 中的 `setStartStateFromOdomOrCurrentTraj()` 提供。
 
 ### 9.2 由新障碍物触发
 
